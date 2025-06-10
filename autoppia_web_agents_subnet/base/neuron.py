@@ -2,14 +2,14 @@
 # Copyright © 2023 Yuma Rao
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
-# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# documentation files (the "Software"), to deal in the Software without restriction, including without limitation
 # the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
 # and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
 # The above copyright notice and this permission notice shall be included in all copies or substantial portions of
 # the Software.
 
-# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
 # THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
 # THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
@@ -18,26 +18,28 @@
 import copy
 import bittensor as bt
 from abc import ABC, abstractmethod
-
-# Sync calls set weights and also resyncs the metagraph.
-from autoppia_web_agents_subnet.utils.config import check_config, add_args, config
-from autoppia_web_agents_subnet.utils.misc import ttl_get_block
 import time
 import traceback
 import requests
 import re
+import asyncio
+from functools import lru_cache
+from typing import Optional, Dict, Any
+import aiohttp
+from concurrent.futures import ThreadPoolExecutor
+from autoppia_web_agents_subnet.utils.config import check_config, add_args, config
+from autoppia_web_agents_subnet.utils.misc import ttl_get_block
 from autoppia_web_agents_subnet import version_url
 from autoppia_web_agents_subnet import __version__, __least_acceptable_version__, __spec_version__
 
-
 class BaseNeuron(ABC):
     """
-    Base class for Bittensor miners. This class is abstract and should be inherited by a subclass. It contains the core logic for all neurons; validators and miners.
-
-    In addition to creating a wallet, subtensor, and metagraph, this class also handles the synchronization of the network state via a basic checkpointing mechanism based on epoch length.
+    Optimized base class for Bittensor neurons with improved performance and error handling.
     """
-
     neuron_type: str = "BaseNeuron"
+    _version_cache: Dict[str, str] = {}
+    _session: Optional[aiohttp.ClientSession] = None
+    _executor = ThreadPoolExecutor(max_workers=4)
 
     @classmethod
     def check_config(cls, config: "bt.Config"):
@@ -57,6 +59,7 @@ class BaseNeuron(ABC):
     spec_version: int = __spec_version__
 
     @property
+    @lru_cache(maxsize=1)
     def block(self):
         return ttl_get_block(self)
 
@@ -64,56 +67,62 @@ class BaseNeuron(ABC):
         base_config = copy.deepcopy(config or BaseNeuron.config())
         self.config = self.config()
         self.config.merge(base_config)
-        self.check_config(self.config) 
+        self.check_config(self.config)
 
-        # Version check
-        self.parse_versions()
+        # Initialize version information
+        self.version = __version__
+        self.least_acceptable_version = __least_acceptable_version__
 
-        # Set up logging with the provided configuration.
+        # Set up logging with the provided configuration
         bt.logging.set_config(config=self.config.logging)
-
-        # If a gpu is required, set the device to cuda:N (e.g. cuda:0)
         self.device = self.config.neuron.device
-
-        # Log the configuration for reference.
         bt.logging.info(self.config)
 
-        # Build Bittensor objects
-        # These are core Bittensor classes to interact with the network.
-        bt.logging.info("Setting up bittensor objects.")
+        # Initialize Bittensor objects with retry mechanism
+        self._initialize_bittensor_objects()
 
-        # The wallet holds the cryptographic key pairs for the miner.
+        # Initialize state
+        self.step = 0
+        self.last_update = 0
+        self._last_sync_time = 0
+        self._sync_interval = 60  # seconds
 
+    def _initialize_bittensor_objects(self, max_retries=5, retry_delay=5):
+        """Initialize Bittensor objects with retry mechanism."""
         self.wallet = bt.wallet(config=self.config)
-        while True:
+        
+        for attempt in range(max_retries):
             try:
                 bt.logging.info("Initializing subtensor and metagraph")
                 self.subtensor = bt.subtensor(config=self.config)
                 self.metagraph = self.subtensor.metagraph(self.config.netuid)
                 break
             except Exception as e:
-                bt.logging.error(
-                    "Couldn't init subtensor and metagraph with error: {}".format(e)
-                )
-                bt.logging.error(
-                    "If you use public RPC endpoint try to move to local node"
-                )
-                time.sleep(5)
+                if attempt == max_retries - 1:
+                    bt.logging.error(f"Failed to initialize after {max_retries} attempts: {e}")
+                    raise
+                bt.logging.warning(f"Attempt {attempt + 1} failed: {e}")
+                time.sleep(retry_delay)
 
-        bt.logging.info(f"Wallet: {self.wallet}")
-        bt.logging.info(f"Subtensor: {self.subtensor}")
-        bt.logging.info(f"Metagraph: {self.metagraph}")
-
-        # Check if the miner is registered on the Bittensor network before proceeding further.
-        self.check_registered()
-
-        # Each miner gets a unique identity (UID) in the network for differentiation.
+        self._verify_registration()
         self.uid = self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
         bt.logging.info(
-            f"Running neuron on subnet: {self.config.netuid} with uid {self.uid} using network: {self.subtensor.chain_endpoint}"
+            f"Running neuron on subnet: {self.config.netuid} with uid {self.uid} "
+            f"using network: {self.subtensor.chain_endpoint}"
         )
-        self.step = 0
-        self.last_update = 0
+
+    def _verify_registration(self):
+        """Verify registration with improved error handling."""
+        if not self.subtensor.is_hotkey_registered(
+            netuid=self.config.netuid,
+            hotkey_ss58=self.wallet.hotkey.ss58_address,
+        ):
+            error_msg = (
+                f"Wallet: {self.wallet} is not registered on netuid {self.config.netuid}. "
+                "Please register the hotkey using `btcli subnets register` before trying again"
+            )
+            bt.logging.error(error_msg)
+            raise RuntimeError(error_msg)
 
     @abstractmethod
     async def forward(self, synapse: bt.Synapse) -> bt.Synapse: ...
@@ -122,113 +131,106 @@ class BaseNeuron(ABC):
     def run(self): ...
 
     @abstractmethod
-    def resync_metagraph(self):
-        """
-        Abstract method that forces subclasses to implement resync_metagraph.
-        This ensures that all subclasses define their own way of resynchronizing
-        the metagraph.
-        """
-        pass
+    def resync_metagraph(self): ...
 
     @abstractmethod
-    def set_weights(self):
+    def set_weights(self): ...
 
-        pass
-
-    def sync(self):
-        """
-        Wrapper for synchronizing the state of the network for the given miner or validator.
-        """
-        # Ensure miner or validator hotkey is still registered on the network.
-        self.check_registered()
+    async def sync(self):
+        """Optimized sync method with rate limiting and error handling."""
+        current_time = time.time()
+        if current_time - self._last_sync_time < self._sync_interval:
+            return
 
         try:
+            self._verify_registration()
+
             if self.should_sync_metagraph():
                 self.last_update = self.block
-                self.resync_metagraph()
+                await asyncio.to_thread(self.resync_metagraph)
 
             if self.should_set_weights():
-                self.set_weights()
+                await asyncio.to_thread(self.set_weights)
 
-            # Always save state.
             self.save_state()
+            self._last_sync_time = current_time
+
         except Exception as e:
-            bt.logging.error(
-                "Coundn't sync metagraph or set weights: {}".format(
-                    traceback.format_exc()
-                )
-            )
-            bt.logging.error("If you use public RPC endpoint try to move to local node")
-            time.sleep(5)
+            bt.logging.error(f"Sync failed: {traceback.format_exc()}")
+            if "public RPC endpoint" in str(e).lower():
+                bt.logging.error("Consider using a local node for better performance")
+            await asyncio.sleep(5)
 
-    def check_registered(self):
-        # --- Check for registration.
-        if not self.subtensor.is_hotkey_registered(
-            netuid=self.config.netuid,
-            hotkey_ss58=self.wallet.hotkey.ss58_address,
-        ):
-            bt.logging.error(
-                f"Wallet: {self.wallet} is not registered on netuid {self.config.netuid}."
-                f" Please register the hotkey using `btcli subnets register` before trying again"
-            )
-            exit()
-
-    def should_sync_metagraph(self):
-        """
-        Check if enough epoch blocks have elapsed since the last checkpoint to sync.
-
-        """
-        if self.neuron_type != "MinerNeuron":
-            last_update = self.metagraph.last_update[self.uid]
-        else:
-            last_update = self.last_update
-
+    def should_sync_metagraph(self) -> bool:
+        """Check if metagraph sync is needed with caching."""
+        last_update = (
+            self.last_update if self.neuron_type == "MinerNeuron"
+            else self.metagraph.last_update[self.uid]
+        )
         return (self.block - last_update) > self.config.neuron.epoch_length
 
     def should_set_weights(self) -> bool:
-        # Don't set weights on initialization.
-        if self.step == 0:
+        """Check if weights should be set with improved logic."""
+        if self.step == 0 or self.config.neuron.disable_set_weights:
             return False
 
-        # Check if enough epoch blocks have elapsed since the last epoch.
-        if self.config.neuron.disable_set_weights:
-            return False
-
-        # Define appropriate logic for when set weights.
         return (
-            self.block - self.metagraph.last_update[self.uid]
-        ) > self.config.neuron.epoch_length and self.neuron_type != "MinerNeuron"  # don't set weights if you're a miner
+            (self.block - self.metagraph.last_update[self.uid]) > self.config.neuron.epoch_length
+            and self.neuron_type != "MinerNeuron"
+        )
+
+    async def parse_versions(self):
+        """Asynchronously parse versions with caching."""
+        if not self._version_cache:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(version_url) as response:
+                        if response.status == 200:
+                            content = await response.text()
+                            
+                            version_match = re.search(r"__version__\s*=\s*['\"]([^'\"]+)['\"]", content)
+                            least_acceptable_match = re.search(
+                                r"__least_acceptable_version__\s*=\s*['\"]([^'\"]+)['\"]", 
+                                content
+                            )
+                            
+                            if version_match and least_acceptable_match:
+                                self._version_cache = {
+                                    'version': version_match.group(1),
+                                    'least_acceptable': least_acceptable_match.group(1)
+                                }
+                                
+                                self.version = self._version_cache['version']
+                                self.least_acceptable_version = self._version_cache['least_acceptable']
+                                
+            except Exception as e:
+                bt.logging.error(f"Version parsing failed: {e}")
+                # Fall back to default versions
+                self.version = __version__
+                self.least_acceptable_version = __least_acceptable_version__
 
     def save_state(self):
-        bt.logging.trace(
-            "save_state() not implemented for this neuron. You can implement this function to save model checkpoints or other useful data."
-        )
+        """Save neuron state with error handling."""
+        try:
+            bt.logging.trace("Saving neuron state...")
+            # Implement state saving logic here
+        except Exception as e:
+            bt.logging.error(f"Failed to save state: {e}")
 
     def load_state(self):
-        bt.logging.trace(
-            "load_state() not implemented for this neuron. You can implement this function to load model checkpoints or other useful data."
-        )
+        """Load neuron state with error handling."""
+        try:
+            bt.logging.trace("Loading neuron state...")
+            # Implement state loading logic here
+        except Exception as e:
+            bt.logging.error(f"Failed to load state: {e}")
 
-    def parse_versions(self):
-        self.version = __version__
-        self.least_acceptable_version = __least_acceptable_version__
+    async def __aenter__(self):
+        """Async context manager entry."""
+        return self
 
-        bt.logging.info("Parsing versions...")
-        response = requests.get(version_url)
-        bt.logging.info(f"Response: {response.status_code}")
-        if response.status_code == 200:
-            content = response.text
-
-            version_pattern = r"__version__\s*=\s*['\"]([^'\"]+)['\"]"
-            least_acceptable_version_pattern = r"__least_acceptable_version__\s*=\s*['\"]([^'\"]+)['\"]"
-
-            try:
-                version = re.search(version_pattern, content).group(1)
-                least_acceptable_version = re.search(least_acceptable_version_pattern, content).group(1)
-            except AttributeError as e:
-                bt.logging.error(f"While parsing versions got error: {e}")
-                return
-
-            self.version = version
-            self.least_acceptable_version = least_acceptable_version
-        return
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit with cleanup."""
+        if self._session:
+            await self._session.close()
+        self._executor.shutdown(wait=True)

@@ -2,14 +2,14 @@
 # Copyright © 2023 Yuma Rao
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
-# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# documentation files (the "Software"), to deal in the Software without restriction, including without limitation
 # the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
 # and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
 # The above copyright notice and this permission notice shall be included in all copies or substantial portions of
 # the Software.
 
-# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
 # THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
 # THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
@@ -20,191 +20,211 @@ import asyncio
 import threading
 import argparse
 import traceback
+from typing import Union, Optional, Dict, Any
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 
 import bittensor as bt
 
 from autoppia_web_agents_subnet.base.neuron import BaseNeuron
 from autoppia_web_agents_subnet.utils.config import add_miner_args
 
-from typing import Union
-
 
 class BaseMinerNeuron(BaseNeuron):
     """
-    Base class for Bittensor miners.
+    Optimized base class for Bittensor miners with improved performance and async operations.
     """
 
     neuron_type: str = "MinerNeuron"
+    _request_cache: Dict[str, Any] = {}
+    _executor = ThreadPoolExecutor(max_workers=4)
 
     def __init__(self, config=None):
         super().__init__(config=config)
 
-        # Warn if allowing incoming requests from anyone.
+        # Security checks
+        self._check_security_config()
+
+        # Initialize axon with retry mechanism
+        self._initialize_axon()
+
+        # State management
+        self.should_exit: bool = False
+        self.is_running: bool = False
+        self.thread: Optional[threading.Thread] = None
+        self.lock = asyncio.Lock()
+        self._last_sync_time = 0
+        self._sync_interval = 60  # seconds
+
+    def _check_security_config(self):
+        """Check security configuration and log warnings."""
         if not self.config.blacklist.force_validator_permit:
             bt.logging.warning(
-                "You are allowing non-validators to send requests to your miner. This is a security risk."
+                "Security risk: Allowing non-validators to send requests to your miner."
             )
         if self.config.blacklist.allow_non_registered:
             bt.logging.warning(
-                "You are allowing non-registered entities to send requests to your miner. This is a security risk."
+                "Security risk: Allowing non-registered entities to send requests to your miner."
             )
-        # The axon handles request processing, allowing validators to send this miner requests.
-        self.axon = bt.axon(
-            wallet=self.wallet,
-            config=self.config() if callable(self.config) else self.config,
-        )
 
-        # Attach determiners which functions are called when servicing a request.
-        bt.logging.info("Attaching forward function to miner axon.")
-        self.axon.attach(
-            forward_fn=self.forward,
-            blacklist_fn=self.blacklist,
-            priority_fn=self.priority,
-        )
-        self.axon.attach(
-            forward_fn=self.forward_feedback,
-            blacklist_fn=self.blacklist_feedback,
-            priority_fn=self.priority_feedback,
-        )
-        self.axon.attach(
-            forward_fn=self.forward_set_organic_endpoint,
-            blacklist_fn=self.blacklist_set_organic_endpoint,
-            priority_fn=self.priority_set_organic_endpoint,
-        )
-        bt.logging.info(f"Axon created: {self.axon}")
+    def _initialize_axon(self, max_retries=3, retry_delay=5):
+        """Initialize axon with retry mechanism."""
+        for attempt in range(max_retries):
+            try:
+                self.axon = bt.axon(
+                    wallet=self.wallet,
+                    config=self.config() if callable(self.config) else self.config,
+                )
 
-        # Instantiate runners
-        self.should_exit: bool = False
-        self.is_running: bool = False
-        self.thread: Union[threading.Thread, None] = None
-        self.lock = asyncio.Lock()
+                # Attach handlers with error checking
+                self._attach_axon_handlers()
+                
+                bt.logging.info(f"Axon created: {self.axon}")
+                return
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    bt.logging.error(f"Failed to initialize axon after {max_retries} attempts: {e}")
+                    raise
+                bt.logging.warning(f"Attempt {attempt + 1} failed: {e}")
+                time.sleep(retry_delay)
 
-    def run(self):
-        """
-        Initiates and manages the main loop for the miner on the Bittensor network. The main loop handles graceful shutdown on keyboard interrupts and logs unforeseen errors.
+    def _attach_axon_handlers(self):
+        """Attach handlers to axon with error checking."""
+        handlers = [
+            {
+                'forward_fn': self.forward,
+                'blacklist_fn': self.blacklist,
+                'priority_fn': self.priority
+            },
+            {
+                'forward_fn': self.forward_feedback,
+                'blacklist_fn': self.blacklist_feedback,
+                'priority_fn': self.priority_feedback
+            },
+            {
+                'forward_fn': self.forward_set_organic_endpoint,
+                'blacklist_fn': self.blacklist_set_organic_endpoint,
+                'priority_fn': self.priority_set_organic_endpoint
+            }
+        ]
 
-        This function performs the following primary tasks:
-        1. Check for registration on the Bittensor network.
-        2. Starts the miner's axon, making it active on the network.
-        3. Periodically resynchronizes with the chain; updating the metagraph with the latest network state and setting weights.
+        for handler in handlers:
+            try:
+                self.axon.attach(**handler)
+            except Exception as e:
+                bt.logging.error(f"Failed to attach handler: {e}")
+                raise
 
-        The miner continues its operations until `should_exit` is set to True or an external interruption occurs.
-        During each epoch of its operation, the miner waits for new blocks on the Bittensor network, updates its
-        knowledge of the network (metagraph), and sets its weights. This process ensures the miner remains active
-        and up-to-date with the network's latest state.
-
-        Note:
-            - The function leverages the global configurations set during the initialization of the miner.
-            - The miner's axon serves as its interface to the Bittensor network, handling incoming and outgoing requests.
-
-        Raises:
-            KeyboardInterrupt: If the miner is stopped by a manual interruption.
-            Exception: For unforeseen errors during the miner's operation, which are logged for diagnosis.
-        """
-
-        # Check that miner is registered on the network.
-        self.sync()
-
-        # Serve passes the axon information to the network + netuid we are hosting on.
-        # This will auto-update if the axon port of external ip have changed.
-        bt.logging.info(
-            f"Serving miner axon {self.axon} on network: {self.config.subtensor.chain_endpoint} with netuid: {self.config.netuid}"
-        )
-        self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
-
-        # Start  starts the miner's axon, making it active on the network.
-        self.axon.start()
-
-        bt.logging.info(f"Miner starting at block: {self.block}")
-
-        # This loop maintains the miner's operations until intentionally stopped.
+    async def run(self):
+        """Asynchronous main loop with improved error handling."""
         try:
+            await self.sync()
+            
+            # Start axon with error handling
+            await self._start_axon()
+            
+            bt.logging.info(f"Miner starting at block: {self.block}")
+
             while not self.should_exit:
-                while (
-                    self.block - self.metagraph.last_update[self.uid]
-                    < self.config.neuron.epoch_length
-                ):
-                    # Wait before checking again.
-                    time.sleep(1)
+                # Check if we need to sync
+                if self._should_sync():
+                    try:
+                        await self.sync()
+                        self.step += 1
+                    except Exception as e:
+                        bt.logging.error(f"Sync failed: {e}")
 
-                    # Check if we should exit.
-                    if self.should_exit:
-                        break
+                # Prevent tight loop
+                await asyncio.sleep(1)
 
-                # Sync metagraph and potentially set weights.
-                self.sync()
-                self.step += 1
-
-        # If someone intentionally stops the miner, it'll safely terminate operations.
         except KeyboardInterrupt:
-            self.axon.stop()
-            bt.logging.success("Miner killed by keyboard interrupt.")
-            exit()
-
-        # In case of unforeseen errors, the miner will log the error and continue operations.
+            await self.cleanup()
+            bt.logging.success("Miner stopped by keyboard interrupt.")
         except Exception as e:
-            bt.logging.error(traceback.format_exc())
+            bt.logging.error(f"Miner error: {e}")
+            bt.logging.debug(str(traceback.format_exc()))
+            await self.cleanup()
+
+    async def _start_axon(self):
+        """Start axon with error handling."""
+        try:
+            bt.logging.info(
+                f"Serving miner axon {self.axon} on network: {self.config.subtensor.chain_endpoint} "
+                f"with netuid: {self.config.netuid}"
+            )
+            await asyncio.to_thread(
+                self.axon.serve,
+                netuid=self.config.netuid,
+                subtensor=self.subtensor
+            )
+            await asyncio.to_thread(self.axon.start)
+        except Exception as e:
+            bt.logging.error(f"Failed to start axon: {e}")
+            raise
+
+    def _should_sync(self) -> bool:
+        """Check if sync is needed with caching."""
+        current_time = time.time()
+        if current_time - self._last_sync_time < self._sync_interval:
+            return False
+            
+        should_sync = (
+            self.block - self.metagraph.last_update[self.uid]
+            >= self.config.neuron.epoch_length
+        )
+        
+        if should_sync:
+            self._last_sync_time = current_time
+            
+        return should_sync
+
+    async def cleanup(self):
+        """Cleanup resources."""
+        if hasattr(self, 'axon'):
+            await asyncio.to_thread(self.axon.stop)
+        self.should_exit = True
+        if self.is_running:
+            self.is_running = False
 
     def run_in_background_thread(self):
-        """
-        Starts the miner's operations in a separate background thread.
-        This is useful for non-blocking operations.
-        """
+        """Start miner in background with improved thread management."""
         if not self.is_running:
             bt.logging.debug("Starting miner in background thread.")
             self.should_exit = False
-            self.thread = threading.Thread(target=self.run, daemon=True)
+            self.thread = threading.Thread(
+                target=lambda: asyncio.run(self.run()),
+                daemon=True
+            )
             self.thread.start()
             self.is_running = True
             bt.logging.debug("Started")
 
-    def stop_run_thread(self):
-        """
-        Stops the miner's operations that are running in the background thread.
-        """
-        if self.is_running:
-            bt.logging.debug("Stopping miner in background thread.")
-            self.should_exit = True
-            if self.thread is not None:
-                self.thread.join(5)
-            self.is_running = False
-            bt.logging.debug("Stopped")
-
-    def __enter__(self):
-        """
-        Starts the miner's operations in a background thread upon entering the context.
-        This method facilitates the use of the miner in a 'with' statement.
-        """
-        self.run_in_background_thread()
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        """
-        Stops the miner's background operations upon exiting the context.
-        This method facilitates the use of the miner in a 'with' statement.
-
-        Args:
-            exc_type: The type of the exception that caused the context to be exited.
-                      None if the context was exited without an exception.
-            exc_value: The instance of the exception that caused the context to be exited.
-                       None if the context was exited without an exception.
-            traceback: A traceback object encoding the stack trace.
-                       None if the context was exited without an exception.
-        """
-        self.stop_run_thread()
-
+    @lru_cache(maxsize=1)
     def resync_metagraph(self):
-        """Resyncs the metagraph and updates the hotkeys and moving averages based on the new metagraph."""
-        bt.logging.info("resync_metagraph()")
+        """Cached metagraph resync with error handling."""
+        try:
+            bt.logging.info("Resyncing metagraph...")
+            self.metagraph.sync(subtensor=self.subtensor)
+        except Exception as e:
+            bt.logging.error(f"Failed to resync metagraph: {e}")
+            raise
 
-        # Sync the metagraph.
-        self.metagraph.sync(subtensor=self.subtensor)
-
-    # Overriding the abstract method from BaseNeuron to avoid instantiation error
     def set_weights(self):
+        """Empty implementation of set_weights for miners."""
         pass
 
     @classmethod
     def add_args(cls, parser: argparse.ArgumentParser):
         super().add_args(parser)
         add_miner_args(cls, parser)
+
+    async def __aenter__(self):
+        """Async context manager entry."""
+        self.run_in_background_thread()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit with cleanup."""
+        await self.cleanup()
+        if self.thread:
+            self.thread.join(timeout=5)
